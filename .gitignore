@@ -1,0 +1,6 @@
+build/
+build-car/
+# Local-only notes and backups (may contain device addresses etc.)
+private/
+.DS_Store
+.vscode/
