@@ -13,9 +13,12 @@
 //
 // Booms are remembered in flash (same slots as boom_test). When the iPhone
 // starts playing, all Booms are paused and restarted together so they stay in
-// sync; when it pauses, the Booms pause too.
+// sync; when it pauses, the Booms pause too. The Booms have no shared clock,
+// so they are also restarted together automatically in quiet gaps (between
+// songs), at most every 3 minutes.
 //
 // Serial commands: s = status, r = resync Booms, d = disconnect all,
+// y / a / t = toggle shared drops / auto resync / resync on stall,
 // f = forget both Booms (they'll be scanned for again),
 // + / - = AUX delay up / down 10 ms (saved).
 //
@@ -38,7 +41,7 @@
 
 #define SMPS_MODE_PIN 1 // CYW43 WL_GPIO1: regulator PWM mode (less ripple)
 #define SBC_STORAGE_SIZE 1030
-#define QUEUE_PACKETS 8 // per Boom: ~8 phone packets of slack (~100+ ms)
+#define QUEUE_PACKETS 16 // per Boom: ~8 phone packets of slack (~100+ ms)
 #define INQUIRY_DURATION 8
 #define RETRY_MS 3000
 #define RETRY_WHILE_PLAYING_MS 15000
@@ -51,7 +54,14 @@
 #define AUX_GAIN_PERCENT 90
 #define AUX_SHAPING 1
 #define AUX_DEFAULT_DELAY_MS 180 // calibrated by ear at home (snares) against a wired speaker
-#define AUX_MAX_DELAY_MS 340 // the PWM ring holds ~371 ms
+#define AUX_MAX_DELAY_MS 500 // the PWM ring holds ~743 ms; leave room for phone bursts
+// Automatic resync. The two speakers have no shared clock, so they slowly
+// drift apart (and away from the AUX output). Restarting them together fixes
+// that, and is inaudible when done in a gap between songs.
+#define SILENCE_LEVEL 32              // |sample| at or below this (~ -60 dBFS) counts as silence
+#define SILENCE_RESYNC_MS 400         // this much silence -> resync now (if due)
+#define AUTO_RESYNC_INTERVAL_MS 180000 // at most this often, unless a speaker stalled
+#define STALL_MS 200                  // a gap this long likely emptied a speaker's buffer
 #define TLV_TAG_AUX_DELAY ((uint32_t)'A' << 24 | 'U' << 16 | 'X' << 8 | 'D')
 #define TLV_TAG_OLD ((uint32_t)'B' << 24 | 'O' << 16 | 'O' << 8 | 'M')
 #define TLV_TAG_BOOM(i) ((uint32_t)'B' << 24 | 'O' << 16 | 'M' << 8 | ('1' + (i)))
@@ -66,7 +76,7 @@ static uint8_t source_config[MAX_BOOMS][4];
 // The phone's bitpool sets the bitrate on all three links. 35 is SBC's
 // standard "middle quality" for 44.1 kHz joint stereo (~230 kbit/s vs ~330 at
 // 53); three links at 53 was more than the Pico's radio could carry.
-#define PHONE_MAX_BITPOOL 53
+#define PHONE_MAX_BITPOOL 45
 static uint8_t sink_caps[4] = SBC_CAPS;
 static uint8_t sink_config[4];
 
@@ -124,6 +134,14 @@ static uint32_t report_start_ms;
 
 static bool resyncing;
 static uint32_t resync_started_ms, last_attempt_ms;
+static uint32_t last_resync_ms;
+static uint32_t silent_frames;  // consecutive near-silent decoded frames
+static bool resync_wanted;      // a speaker stalled: resync at the next silence
+static uint32_t auto_resyncs, stall_flags, shared_drops;
+// Runtime switches (serial y / a / t) while we find what helps on the road.
+static bool shared_drop_mode = false; // drop for both Booms when one is full
+static bool auto_resync_mode = true;  // resync in quiet gaps
+static bool stall_resync_mode = false; // a stall makes a resync due at once
 static bool scanning;
 static btstack_timer_source_t manager_timer, stats_timer;
 static btstack_packet_callback_registration_t hci_callback;
@@ -199,6 +217,13 @@ static void boom_reset_queue(boom_t *b) {
     b->tail_open = false;
 }
 
+// Can this Boom's queue take another frame of len bytes right now?
+static bool boom_can_take(const boom_t *b, int len) {
+    if (b->q_count && b->tail_open && b->q[(b->q_head + b->q_count - 1) % QUEUE_PACKETS].len + len <= b->max_payload)
+        return true;
+    return b->q_count < QUEUE_PACKETS;
+}
+
 static void boom_add_frame(boom_t *b, const uint8_t *frame, int len) {
     packet_t *tail = b->q_count ? &b->q[(b->q_head + b->q_count - 1) % QUEUE_PACKETS] : NULL;
     if (!tail || !b->tail_open || tail->len + len > b->max_payload) {
@@ -237,6 +262,10 @@ static void boom_send(boom_t *b) {
     b->packets_sent++;
     uint32_t now = btstack_run_loop_get_time_ms();
     if (b->last_send_ms && now - b->last_send_ms > b->max_gap_ms) b->max_gap_ms = now - b->last_send_ms;
+    if (b->last_send_ms && now - b->last_send_ms > STALL_MS && !resyncing) {
+        if (stall_resync_mode) resync_wanted = true; // this Boom probably ran dry and re-buffered
+        stall_flags++;
+    }
     b->last_send_ms = now;
     boom_kick(b);
 }
@@ -262,47 +291,57 @@ static void aux_pcm(int16_t *data, int num_frames, int num_channels, int sample_
     (void)sample_rate;
     (void)ctx;
     for (int i = 0; i < num_frames; i++) {
-        if (aux_skip) { aux_skip--; continue; }
         int16_t l = data[i * num_channels], r = num_channels > 1 ? data[i * num_channels + 1] : l;
+        if (l <= SILENCE_LEVEL && l >= -SILENCE_LEVEL && r <= SILENCE_LEVEL && r >= -SILENCE_LEVEL) {
+            if (silent_frames < 0x7fffffff) silent_frames++;
+        } else {
+            silent_frames = 0;
+        }
+        if (aux_skip) { aux_skip--; continue; }
         if (!pwm_audio_push(l, r)) aux_dropped++;
     }
 }
 
-// Top the queue up with silence to the target delay (stream start, or after
-// the delay was raised). Lowering the delay is left to the speed trim.
+// Top the queue up with silence to the given depth.
 static void aux_fill_to(uint32_t target) {
     for (uint32_t q = pwm_audio_queued_frames(); q < target; q++) pwm_audio_push(0, 0);
 }
-static void aux_prime(void) { aux_fill_to(aux_delay_frames()); }
 
 // Once a second: steer playback speed so the queue sits at the target delay.
-// PI control. P: 10 ms off -> 300 ppm. I: +1 ppm per second per 10 ms off,
-// capped at +/-300 ppm, learns the real phone-vs-Pico clock difference so the
-// delay settles exactly on target. The phone sends a little slow for the
-// first ~20 s after play (measured 43,970 vs 44,100 Hz), which is not a
-// clock difference, so the I term doesn't learn in the first 10 s. Both capped at 1000 ppm. The learned clock
-// offset is kept across pauses.
+// The phone sends in bursts (gaps up to ~170 ms in the car), so a 1 s average
+// of the queue depth is noisy: steering on it made the AUX wander +/-50 ms
+// around the Booms. The real phone-vs-Pico clock difference is a few hundred
+// ppm (< 0.5 ms/s), so smooth over ~8 s and steer gently.
+// P: 10 ms off -> 60 ppm. I: learns the clock offset slowly (capped +/-300 ppm,
+// not in the first 10 s, when the phone sends a little slow). Total +/-500 ppm.
+// Jumps (silence in / skip out) only when > 80 ms off.
 static int32_t trim_integral_ppm;
+static int32_t fill_ema; // smoothed queue depth after a phone packet, frames
+static bool fill_ema_valid;
 
 static void aux_steer(void) {
     if (!phone.streaming || !fill_count) { pwm_audio_set_rate_trim_ppm(trim_integral_ppm); return; }
     int32_t avg = (int32_t)(fill_sum / fill_count);
     fill_sum = 0;
     fill_count = 0;
-    int32_t err = avg - (int32_t)aux_delay_frames();
-    // More than 20 ms off: jump straight to target (silence in, or skip out).
-    if (err > 882 || err < -882) {
+    if (!fill_ema_valid) { fill_ema = avg; fill_ema_valid = true; }
+    else fill_ema += (avg - fill_ema) / 8;
+    int32_t err = fill_ema - (int32_t)aux_delay_frames();
+    // No jumps in the first 30 s: the phone sends slow then, which drains the
+    // queue but doesn't move the AUX against the Booms (they drain too).
+    if ((err > 3528 || err < -3528) && btstack_run_loop_get_time_ms() - rate_t0_ms > 30000) {
         if (err > 0) aux_skip += (uint32_t)err;
         else aux_fill_to(pwm_audio_queued_frames() + (uint32_t)-err);
+        fill_ema -= err;
         aux_jumps++;
         return;
     }
-    if (btstack_run_loop_get_time_ms() - rate_t0_ms > 10000) trim_integral_ppm += err / 441;
+    if (btstack_run_loop_get_time_ms() - rate_t0_ms > 10000) trim_integral_ppm += err / 1764;
     if (trim_integral_ppm > 300) trim_integral_ppm = 300;
     if (trim_integral_ppm < -300) trim_integral_ppm = -300;
-    trim_ppm = err * 300 / 441 + trim_integral_ppm;
-    if (trim_ppm > 1000) trim_ppm = 1000;
-    if (trim_ppm < -1000) trim_ppm = -1000;
+    trim_ppm = err * 60 / 441 + trim_integral_ppm;
+    if (trim_ppm > 500) trim_ppm = 500;
+    if (trim_ppm < -500) trim_ppm = -500;
     pwm_audio_set_rate_trim_ppm(trim_ppm);
 }
 
@@ -319,13 +358,37 @@ static void load_aux_delay(void) {
 static void set_aux_delay(int32_t ms) {
     if (ms < 0) ms = 0;
     if (ms > AUX_MAX_DELAY_MS) ms = AUX_MAX_DELAY_MS;
+    int32_t delta = (ms - (int32_t)aux_delay_ms) * 441 / 10; // frames
     aux_delay_ms = (uint32_t)ms;
-    if (phone.streaming) aux_prime(); // raising takes effect now; lowering via the jump/skip
+    // Apply the change exactly and at once: silence in to go later, skip
+    // audio to go earlier. The smoothed measurement moves with it.
+    if (phone.streaming) {
+        if (delta > 0) aux_fill_to(pwm_audio_queued_frames() + (uint32_t)delta);
+        else aux_skip += (uint32_t)-delta;
+        fill_ema += delta;
+    }
     const btstack_tlv_t *t;
     void *c;
     tlv(&t, &c);
     t->store_tag(c, TLV_TAG_AUX_DELAY, (const uint8_t *)&aux_delay_ms, sizeof aux_delay_ms);
     printf("AUX delay now %lu ms (saved)\n", (unsigned long)aux_delay_ms);
+}
+
+static void resync(void);
+
+// In a quiet gap (between songs, a pause in speech), restart the Booms
+// together if it's been a while or a Boom stalled since the last resync.
+static void maybe_auto_resync(void) {
+    if (!auto_resync_mode || resyncing || silent_frames < SILENCE_RESYNC_MS * 441 / 10) return;
+    int streaming = 0;
+    for (int i = 0; i < MAX_BOOMS; i++) streaming += booms[i].state == B_STREAMING;
+    if (!streaming) return;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (!resync_wanted && now - last_resync_ms < AUTO_RESYNC_INTERVAL_MS) return;
+    printf("Auto resync in silence (%s).\n", resync_wanted ? "a Boom stalled" : "periodic");
+    auto_resyncs++;
+    silent_frames = 0;
+    resync();
 }
 
 static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
@@ -357,13 +420,24 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     fill_sum += pwm_audio_queued_frames();
     fill_count++;
 
+    maybe_auto_resync();
     if (resyncing) return; // Booms are restarting; drop until they're all back
 
     for (int n = 0; n < num_frames; n++) {
         int len = sbc_frame_len(packet + pos, size - pos);
         if (len < 0) { phone.bad_packets++; break; }
+        // A frame dropped for only one Boom moves that Boom ~3 ms ahead of the
+        // other, permanently. So if any Boom can't take it, no Boom gets it:
+        // a tiny glitch on both, but they stay in step.
+        bool fits = true;
         for (int i = 0; i < MAX_BOOMS; i++)
-            if (booms[i].state == B_STREAMING) boom_add_frame(&booms[i], packet + pos, len);
+            if (shared_drop_mode && booms[i].state == B_STREAMING && !boom_can_take(&booms[i], len)) fits = false;
+        for (int i = 0; i < MAX_BOOMS; i++) {
+            if (booms[i].state != B_STREAMING) continue;
+            if (fits) boom_add_frame(&booms[i], packet + pos, len); // drops a full Boom's frame itself
+            else booms[i].frames_dropped++;
+        }
+        if (!fits) shared_drops++;
         pos += len;
         phone.frames_in++;
     }
@@ -414,6 +488,8 @@ static void resync_step(void) {
 // frame with an empty buffer.
 static void resync(void) {
     if (!phone.streaming) return;
+    last_resync_ms = btstack_run_loop_get_time_ms();
+    resync_wanted = false;
     pause_booms();
     resyncing = true;
     resync_started_ms = btstack_run_loop_get_time_ms();
@@ -670,6 +746,7 @@ static void sink_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         phone.streaming = true;
         phone.last_in_ms = 0;
         aux_need_prime = true;
+        fill_ema_valid = false;
         rate_t0_ms = btstack_run_loop_get_time_ms();
         rate_in0 = pwm_audio_pushed_total();
         rate_out0 = pwm_audio_played_total();
@@ -781,6 +858,9 @@ static void print_status(void) {
         b->max_queue = 0;
     }
     uint32_t now = btstack_run_loop_get_time_ms(), span = now - report_start_ms;
+    printf(" | auto resyncs %lu, stalls %lu, shared drops %lu%s", (unsigned long)auto_resyncs,
+           (unsigned long)stall_flags, (unsigned long)shared_drops, resync_wanted ? " (resync pending)" : "");
+    printf(" | AUX smoothed %ld ms", (long)(fill_ema * 10 / 441));
     printf(" | AUX delay %lu ms, queued %lu ms, trim %ld ppm, jumps %lu, underruns %lu, dropped %lu, decode %lu%% CPU%s\n",
            (unsigned long)aux_delay_ms, (unsigned long)(pwm_audio_queued_frames() * 10 / 441), (long)trim_ppm,
            (unsigned long)aux_jumps,
@@ -806,6 +886,9 @@ static void stdin_handler(char c) {
     switch (c) {
     case 's': print_status(); break;
     case 'r': resync(); break;
+    case 'y': shared_drop_mode = !shared_drop_mode; printf("shared drops %s\n", shared_drop_mode ? "ON" : "off"); break;
+    case 'a': auto_resync_mode = !auto_resync_mode; printf("auto resync %s\n", auto_resync_mode ? "ON" : "off"); break;
+    case 't': stall_resync_mode = !stall_resync_mode; printf("stall resync %s\n", stall_resync_mode ? "ON" : "off"); break;
     case 'd':
         for (int i = 0; i < MAX_BOOMS; i++)
             if (booms[i].a2dp_cid) a2dp_source_disconnect(booms[i].a2dp_cid);

@@ -90,11 +90,15 @@ From then on: power the Pico, switch on the speakers, play.
 | 2 quick presses | AUX 10 ms earlier | 2 blinks |
 | Hold 2 s | Restart both speakers together (resync) | 3 blinks |
 
+The speakers are also resynced automatically in quiet gaps between songs, so
+holding the button should rarely be needed.
+
 Tune by ear on drum hits: if the car speakers hit first, press once; if the
 Bluetooth speakers hit first, double-press. The setting is saved.
 
 **USB serial** (development build, 115200 baud): `s` status, `+`/`-` AUX delay,
-`r` resync, `d` disconnect speakers, `f` forget both speakers.
+`r` resync, `d` disconnect speakers, `f` forget both speakers, `a` toggle
+automatic resync (plus test toggles `y` and `t`, see STATUS.md).
 
 ## How it works
 

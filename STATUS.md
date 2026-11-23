@@ -112,8 +112,43 @@ with the Pico, and the Pico sends the same audio to both speakers itself.
 
 Car build (USB off) on a power bank, AUX into the car stereo: works.
 
+### 6. On the road (first drives)
+
+Speakers drifted apart within minutes and the AUX timing against them was
+inconsistent. Findings from a drive with the logging build (USB on, Pico
+powered by a laptop):
+
+- **Radio load is higher in a moving car.** At bitpool 53 both speakers
+  sometimes lost ~25 % of frames. **Bitpool 45** (`PHONE_MAX_BITPOOL`) fixed
+  that with little audible loss; the per-speaker queue went 8 → 16 packets.
+- **AUX ring too small for a car-tuned delay.** The delay had been tuned up
+  to ~290 ms in the car; with phone bursts on top the 371 ms ring overflowed
+  (crackles). Ring doubled to 32768 frames (~743 ms); max delay now 500 ms.
+- **AUX steering chased phone burstiness.** Phone packets arrive up to
+  ~170 ms apart in the car, so the 1 s average of the queue depth swung
+  ±50 ms and the trim slammed ±1000 ppm, with frequent jumps — the AUX
+  wandered around the speakers. Now: ~8 s smoothing, P 60 ppm per 10 ms,
+  total ±500 ppm, jumps only when > 80 ms off and never in the first 30 s
+  (the phone sends slow then; the speakers drain too, so it isn't a real
+  offset). Button steps now apply exactly 10 ms at once (silence in / skip).
+- **Speaker-to-speaker drift.** No shared clock, and a frame dropped for only
+  one speaker moves it ~3 ms ahead for good. The speakers are now restarted
+  together automatically in quiet gaps (≥ 400 ms below ~−60 dBFS, typically
+  between songs), at most every 3 minutes.
+- Tried and switched off by default (serial toggles for testing):
+  dropping a frame for both speakers whenever one is full (`y`) — sounded
+  worse, every congestion glitch hit both; resync as soon as a speaker stalls
+  ≥ 200 ms (`t`). Auto resync can be toggled with `a`.
+
+After these, the Pico itself dropped nothing. Some crackling remained;
+not yet narrowed down to the speakers (phone gaps passed straight through —
+a steady-pacing buffer would help) or the AUX (USB-on build).
+
 ## Open questions
 
-- Long-term drift between the two speakers (no shared clock). Hold BOOTSEL
-  for 2 s to resync if it ever becomes audible.
+- Remaining occasional crackles (see above): speakers, AUX, or both?
+- Whether the automatic resync on silence keeps up during long stretches with
+  no gaps (DJ mixes, crossfade on). Hold BOOTSEL for 2 s to resync by hand.
+- Podcasts: a resync in a pause in speech could clip the first syllable on
+  the speakers. Raise `SILENCE_RESYNC_MS` if that's noticeable.
 - Speaker volume is per speaker (their own buttons); no AVRCP volume control.

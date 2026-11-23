@@ -12,8 +12,8 @@
 #include "pico/multicore.h"
 
 // --- ring buffer (core 0 writes, core 1 reads) -----------------------------
-// 16384 frames = ~371 ms at 44.1 kHz: room for the Boom delay later.
-#define RING_FRAMES 16384u
+// 32768 frames = ~743 ms at 44.1 kHz: room for a long AUX delay plus phone bursts.
+#define RING_FRAMES 32768u
 #define RING_MASK (RING_FRAMES - 1u)
 static uint32_t ring[RING_FRAMES]; // (uint16 right << 16) | uint16 left
 static volatile uint32_t ring_head; // written by core 0
