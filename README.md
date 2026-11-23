@@ -124,6 +124,13 @@ gotchas (radio throughput limits, sync, noise hunting, drift).
 | `config/btstack_config.h` | BTstack configuration |
 | `build.sh` | Build / flash helper |
 
+## License
+
+MIT — see [LICENSE](LICENSE). This covers the project's own code. The Pico SDK
+and BTstack keep their own licenses, and the parts of `src/boom_test.c` and
+`src/hub.c` adapted from BTstack's examples remain subject to BTstack's terms
+(see Credits).
+
 ## Credits
 
 Built on the [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk)
